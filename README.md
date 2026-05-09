@@ -107,14 +107,17 @@ pixel MSE.
 |----------------|-------------------------------------|-------------|------------|----------------------------------------------|
 | `tworoom`      | custom 2D nav (this repo)           | 48 x 48     | 2          | random-policy rollouts collected on first run |
 | `reacher`      | custom 2-link arm (this repo)       | 48 x 48     | 2          | random-policy rollouts collected on first run |
-| `pusht`        | `pymunk` physics, T-shaped block    | 96 x 96     | 2          | random-policy rollouts collected on first run |
-| `pusht_expert` | (data only — uses `pusht` env)      | 96 x 96     | 2          | Diffusion-Policy's released expert dataset (`pusht.zip`, ~31 MB), auto-downloaded |
+| `pusht`        | `pymunk` physics, T-shaped block    | 96 x 96     | 2 (pos)    | random-policy rollouts collected on first run |
+| `pusht_expert` | (data only — uses `pusht` env)      | 96 x 96     | 2 (pos)    | Diffusion-Policy's released expert dataset (`pusht.zip`, ~31 MB), auto-downloaded |
 | `cube`         | `ogbench` `cube-single-play-v0`     | 64 x 64     | 5          | OGBench's released action stream replayed in env, frames re-rendered |
 | `synthetic`    | `lewm.data.MovingBlobDataset`       | 56 x 56     | 2          | analytic moving-blob trajectories (no env)    |
 
-Datasets are cached under `./data/{env}_{source}_n{N}_T{T}_S{S}_seed{seed}.pt`.
-First run for `cube` will download the ogbench dataset (~270 MB) under
-`~/.ogbench/data/`; subsequent runs reuse it.
+Datasets are cached under `./data/{env}_{source}_n{N}_T{T}_S{S}_seed{seed}.pt`
+(pusht/pusht_expert get a `_pos` suffix marking the position-command
+convention). First run for `cube` will download the ogbench dataset (~270 MB)
+under `~/.ogbench/data/`; subsequent runs reuse it. For `pusht`/`pusht_expert`,
+action `[-1, 1]` is target agent position via `target = (a+1)*0.5*WORLD` —
+matching DP's reference convention.
 
 ## Default config
 
@@ -390,14 +393,14 @@ end-to-end smoke test. What's still missing relative to the paper:
   Diffusion-Policy's `pusht.zip` (~31 MB), normalizes the action range to
   [-1, 1], and slides 16-step windows. Probing shows it's substantially
   better than the random-rollout `pusht`.
-- [ ] **Push-T action-modality mismatch**: the expert dataset's actions
-  are *target end-effector positions* (DP's control mode), but our
-  `lewm/envs/pusht.py` treats actions as *velocity commands*. So a model
-  trained on `pusht_expert` and evaluated against our `pusht` env doesn't
-  steer correctly — CEM finds plans that look fine in latent space but the
-  env interprets them differently. To close this gap, switch our pusht env
-  to position-command control (matching DP's reference) or convert the
-  expert action stream into velocities before normalization.
+- [x] **Push-T action-modality alignment**: env switched to position-command
+  control matching DP's reference. Action `[-1, 1]` maps to world coordinates
+  via `target = (a + 1) * 0.5 * WORLD`. The expert loader now uses the same
+  fixed `[0, WORLD] -> [-1, 1]` normalization (instead of the previous
+  dataset-min/max scheme), so env and dataset agree on what action `[-1, 1]`
+  means. Cache key bumped (`*_pos_*`) so old velocity-convention data is
+  ignored. Pre-existing `pusht`/`pusht_expert` checkpoints are inconsistent
+  with the new convention and should be retrained.
 - [ ] Custom Two-Room and Reacher envs are minimal-but-faithful shapes /
   dynamics and won't byte-match any specific reference implementation. (No
   public LeWM-released datasets are known for these.)

@@ -2,7 +2,10 @@
 
 Faithful port of the Diffusion-Policy reference Push-T (Florence Chi et al.):
 - Square arena, T-shaped block, agent (disk) pushes the T to overlap a target T.
-- Continuous 2D action: agent target position (kinematic, integrated by pymunk).
+- Continuous 2D action: target agent position. Action [-1, 1] maps to world
+  coordinates [0, WORLD] via `target = (a + 1) * 0.5 * WORLD`. This matches
+  DP's reference convention so the upstream expert dataset (positions in
+  pixel coords) and our env interpret action [-1, 1] consistently.
 - Pixel observation rendered via OpenCV at obs_size x obs_size (paper used 96x96
   in upstream, paper text mentions 48x48 for planning-time comparisons).
 """
@@ -21,7 +24,9 @@ WORLD = 512.0   # internal pymunk world size in pixels
 DT = 1.0 / 60.0
 SUBSTEPS = 6
 AGENT_RADIUS = 15.0
-AGENT_SPEED = 6.0  # max world-units per env step that the agent can be pulled
+# Cap on agent travel per env step in world units. Bounds how aggressive the
+# position-command tracker can be when the target is far from the current pose.
+MAX_AGENT_STEP = 30.0
 
 
 def _make_t_block(space: pymunk.Space, position: Vec2d, angle: float, color: tuple) -> pymunk.Body:
@@ -98,12 +103,21 @@ class PushT:
         return self.render()
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, bool, dict]:
-        # Action: 2D in [-1, 1] — interpret as desired velocity for the agent.
+        # Action: 2D in [-1, 1] — target agent position in world coords via
+        # target = (a + 1) * 0.5 * WORLD. Matches DP reference convention.
         a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
-        target_vel = Vec2d(float(a[0]) * 200.0, float(a[1]) * 200.0)
-        # Apply force toward target velocity (PD-ish, since damping is high)
-        delta = target_vel - self.agent.velocity
-        self.agent.velocity = self.agent.velocity + delta * 0.5
+        target = Vec2d(
+            float((a[0] + 1.0) * 0.5 * WORLD),
+            float((a[1] + 1.0) * 0.5 * WORLD),
+        )
+        delta = target - self.agent.position
+        dist = delta.length
+        if dist > 1e-6:
+            step_dist = min(dist, MAX_AGENT_STEP)
+            # Velocity required to traverse step_dist world units in DT seconds.
+            self.agent.velocity = delta.normalized() * (step_dist / DT)
+        else:
+            self.agent.velocity = Vec2d(0.0, 0.0)
 
         for _ in range(SUBSTEPS):
             self.space.step(DT / SUBSTEPS)

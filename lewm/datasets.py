@@ -41,8 +41,11 @@ class TrajSpec:
 
 
 def _cache_path(spec: TrajSpec) -> str:
+    # Pusht switched from velocity-command to position-command actions; tag
+    # the cache so old velocity-convention data is not silently reused.
+    convention = "_pos" if spec.env_name in ("pusht", "pusht_expert") else ""
     fname = (
-        f"{spec.env_name}_{spec.source}_n{spec.num_trajectories}"
+        f"{spec.env_name}_{spec.source}{convention}_n{spec.num_trajectories}"
         f"_T{spec.seq_len}_S{spec.obs_size}_seed{spec.seed}.pt"
     )
     return os.path.join(CACHE_DIR, fname)
@@ -252,14 +255,20 @@ def _collect_pusht_expert(spec: TrajSpec) -> dict:
         if (i + 1) % max(1, spec.num_trajectories // 10) == 0:
             print(f"  pusht_expert {i+1}/{spec.num_trajectories} ({time.time()-t0:.1f}s)")
 
-    # Normalize actions to [-1, 1] using the dataset action range. The zarr
-    # actions are in pixel-coords (~[0, 512]); re-scale to match our env
-    # convention so a model trained here is consistent with our pusht env.
-    a_lo, a_hi = act_buf.min(), act_buf.max()
-    print(f"  pusht_expert action range: [{a_lo:.1f}, {a_hi:.1f}] -> normalizing to [-1, 1]")
-    a_mid = 0.5 * (a_lo + a_hi)
-    a_half = 0.5 * (a_hi - a_lo)
-    act_buf = ((act_buf - a_mid) / max(a_half, 1e-6)).astype(np.float32)
+    # Normalize actions to [-1, 1] using the env's fixed world coordinates.
+    # Zarr actions are target end-effector positions in pixel coords on a
+    # 512x512 world; map [0, WORLD] -> [-1, 1] to match pusht.step()'s
+    # interpretation `target = (a + 1) * 0.5 * WORLD`. Using a fixed mapping
+    # (rather than dataset min/max) ensures action [-1, 1] means the same
+    # world position whether the model rolls out in the env or trains on
+    # this dataset.
+    from .envs.pusht import WORLD as PUSHT_WORLD
+    a_lo, a_hi = float(act_buf.min()), float(act_buf.max())
+    print(
+        f"  pusht_expert raw action range: [{a_lo:.1f}, {a_hi:.1f}] "
+        f"-> mapping [0, {PUSHT_WORLD:.0f}] to [-1, 1]"
+    )
+    act_buf = (2.0 * act_buf / PUSHT_WORLD - 1.0).clip(-1.0, 1.0).astype(np.float32)
 
     return {"obs": obs_buf, "actions": act_buf}
 
