@@ -17,18 +17,19 @@ from lewm.data import MovingBlobDataset, SyntheticConfig
 
 # Sensible per-env defaults if user doesn't override.
 ENV_DEFAULTS = {
-    "tworoom":   {"obs_size": 48, "seq_len": 16, "num_trajs": 512},
-    "reacher":   {"obs_size": 48, "seq_len": 16, "num_trajs": 512},
-    "pusht":     {"obs_size": 96, "seq_len": 16, "num_trajs": 256},
-    "cube":      {"obs_size": 64, "seq_len": 16, "num_trajs": 128},
-    "synthetic": {"obs_size": 56, "seq_len": 8,  "num_trajs": 1024},
+    "tworoom":      {"obs_size": 48, "seq_len": 16, "num_trajs": 512},
+    "reacher":      {"obs_size": 48, "seq_len": 16, "num_trajs": 512},
+    "pusht":        {"obs_size": 96, "seq_len": 16, "num_trajs": 256},
+    "pusht_expert": {"obs_size": 96, "seq_len": 16, "num_trajs": 1024},
+    "cube":         {"obs_size": 64, "seq_len": 16, "num_trajs": 128},
+    "synthetic":    {"obs_size": 56, "seq_len": 8,  "num_trajs": 1024},
 }
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--env", type=str, default="synthetic",
-                   choices=list_envs() + ["synthetic"],
+                   choices=list_envs() + ["synthetic", "pusht_expert"],
                    help="env to train on (default: synthetic moving blob)")
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=32)
@@ -42,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt", type=str, default=None)
+    p.add_argument("--amp", action="store_true",
+                   help="enable mixed-precision (bf16 autocast) training")
     return p.parse_args()
 
 
@@ -109,6 +112,11 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # bf16 autocast on Ampere+ (RTX 3070 supports bf16). bf16 needs no GradScaler.
+    use_amp = args.amp and device.type == "cuda"
+    if use_amp:
+        print("AMP: bf16 autocast enabled")
+
     step = 0
     t0 = time.time()
     for epoch in range(args.epochs):
@@ -116,8 +124,9 @@ def main():
             obs = obs.to(device, non_blocking=True)
             actions = actions.to(device, non_blocking=True)
 
-            out = model(obs, actions)
             opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                out = model(obs, actions)
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()

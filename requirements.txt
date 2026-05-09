@@ -8,3 +8,4 @@ pymunk>=7.0
 mujoco>=3.0
 gymnasium>=1.0
 ogbench>=1.0
+zarr>=3.0

@@ -6,6 +6,7 @@ from .planner import cem_plan
 from .datasets import make_dataset, TrajectoryDataset
 from .envs import make_env, list_envs
 from .eval import MPCController, MPCConfig, evaluate
+from .probing import probe, ProbeResult
 
 __all__ = [
     "ViTEncoder",
@@ -21,4 +22,6 @@ __all__ = [
     "MPCController",
     "MPCConfig",
     "evaluate",
+    "probe",
+    "ProbeResult",
 ]

@@ -135,6 +135,135 @@ def _action_dim_for(env_name: str) -> int:
     return env.action_dim
 
 
+_PUSHT_EXPERT_URL = "https://diffusion-policy.cs.columbia.edu/data/training/pusht.zip"
+_PUSHT_EXPERT_DIR = os.path.expanduser("~/.lewm/pusht_expert")
+
+
+def _find_zarr_root(base_dir: str) -> str | None:
+    """Walk base_dir looking for a directory containing a 'data' subdir with zarr arrays."""
+    for root, dirs, _ in os.walk(base_dir):
+        if "data" in dirs and "meta" in dirs:
+            return root
+    return None
+
+
+def _download_pusht_expert() -> str:
+    """Download + unzip the Diffusion-Policy Push-T expert dataset.
+
+    Returns the local path to the unzipped zarr root (the directory that
+    contains `data/img`, `data/action`, `meta/episode_ends`).
+    """
+    import urllib.request
+    import zipfile
+
+    os.makedirs(_PUSHT_EXPERT_DIR, exist_ok=True)
+    zarr_root = _find_zarr_root(_PUSHT_EXPERT_DIR)
+    if zarr_root is not None:
+        return zarr_root
+
+    zip_path = os.path.join(_PUSHT_EXPERT_DIR, "pusht.zip")
+    if not os.path.exists(zip_path):
+        print(f"downloading Push-T expert dataset ({_PUSHT_EXPERT_URL})...")
+        with urllib.request.urlopen(_PUSHT_EXPERT_URL) as resp, open(zip_path, "wb") as f:
+            total = int(resp.headers.get("Content-Length", 0))
+            chunk = 1 << 20
+            read = 0
+            while True:
+                buf = resp.read(chunk)
+                if not buf:
+                    break
+                f.write(buf)
+                read += len(buf)
+                if total:
+                    print(f"  {read/total*100:5.1f}%  ({read/1e6:.1f}/{total/1e6:.1f} MB)", end="\r")
+        print()
+    print(f"unzipping into {_PUSHT_EXPERT_DIR}")
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(_PUSHT_EXPERT_DIR)
+    zarr_root = _find_zarr_root(_PUSHT_EXPERT_DIR)
+    if zarr_root is None:
+        raise RuntimeError(f"could not find a zarr root in {_PUSHT_EXPERT_DIR} after unzip")
+    return zarr_root
+
+
+def _collect_pusht_expert(spec: TrajSpec) -> dict:
+    """Convert Diffusion-Policy's pusht_cchi_v7_replay.zarr into our format.
+
+    The upstream dataset stores all transitions in flat arrays:
+      data/img    : (N, 96, 96, 3) uint8
+      data/action : (N, 2)         float32  (target end-effector position in world units)
+      meta/episode_ends : (E,)     int       (cumulative end indices)
+
+    We slide a length-`seq_len` window across each episode and sample
+    `num_trajectories` windows uniformly at random.
+    """
+    import zarr
+    import cv2
+
+    zarr_root = _download_pusht_expert()
+    store = zarr.open(zarr_root, mode="r")
+    imgs = store["data/img"]                     # (N, 96, 96, 3) uint8
+    acts = store["data/action"]                  # (N, 2) float32
+    ep_ends = np.asarray(store["meta/episode_ends"][:], dtype=np.int64)
+    if spec.action_dim != acts.shape[1]:
+        raise ValueError(
+            f"pusht_expert action_dim mismatch: spec={spec.action_dim} vs zarr={acts.shape[1]}"
+        )
+
+    # Build (start, end] episode ranges
+    starts = np.concatenate([[0], ep_ends[:-1]])
+    rng = np.random.default_rng(spec.seed)
+
+    # Randomly sample (episode, offset) pairs whose window fits.
+    candidates: list[tuple[int, int]] = []
+    for s, e in zip(starts, ep_ends):
+        if e - s >= spec.seq_len:
+            candidates.extend((s, off) for off in range(e - s - spec.seq_len + 1))
+    if len(candidates) < spec.num_trajectories:
+        raise RuntimeError(
+            f"only {len(candidates)} valid {spec.seq_len}-step windows in expert data;"
+            f" reduce num/seq_len"
+        )
+    idx = rng.choice(len(candidates), size=spec.num_trajectories, replace=False)
+    chosen = [candidates[i] for i in idx]
+
+    obs_buf = np.empty(
+        (spec.num_trajectories, spec.seq_len, spec.obs_size, spec.obs_size, 3), dtype=np.uint8
+    )
+    act_buf = np.empty(
+        (spec.num_trajectories, spec.seq_len - 1, spec.action_dim), dtype=np.float32
+    )
+
+    t0 = time.time()
+    for i, (s, off) in enumerate(chosen):
+        base = s + off
+        # Read the seq_len consecutive frames + (seq_len-1) actions
+        win_imgs = np.asarray(imgs[base : base + spec.seq_len])
+        win_acts = np.asarray(acts[base : base + spec.seq_len - 1], dtype=np.float32)
+        if win_imgs.shape[1] != spec.obs_size:
+            # Resize to requested resolution
+            for t in range(spec.seq_len):
+                obs_buf[i, t] = cv2.resize(
+                    win_imgs[t], (spec.obs_size, spec.obs_size), interpolation=cv2.INTER_AREA
+                )
+        else:
+            obs_buf[i] = win_imgs
+        act_buf[i] = win_acts
+        if (i + 1) % max(1, spec.num_trajectories // 10) == 0:
+            print(f"  pusht_expert {i+1}/{spec.num_trajectories} ({time.time()-t0:.1f}s)")
+
+    # Normalize actions to [-1, 1] using the dataset action range. The zarr
+    # actions are in pixel-coords (~[0, 512]); re-scale to match our env
+    # convention so a model trained here is consistent with our pusht env.
+    a_lo, a_hi = act_buf.min(), act_buf.max()
+    print(f"  pusht_expert action range: [{a_lo:.1f}, {a_hi:.1f}] -> normalizing to [-1, 1]")
+    a_mid = 0.5 * (a_lo + a_hi)
+    a_half = 0.5 * (a_hi - a_lo)
+    act_buf = ((act_buf - a_mid) / max(a_half, 1e-6)).astype(np.float32)
+
+    return {"obs": obs_buf, "actions": act_buf}
+
+
 def make_dataset(
     env_name: str,
     num_trajectories: int = 256,
@@ -144,11 +273,20 @@ def make_dataset(
     source: str | None = None,
 ) -> "TrajectoryDataset":
     """Load (or collect + cache) a trajectory dataset for the named env."""
-    default_size = {"tworoom": 48, "reacher": 48, "pusht": 96, "cube": 64}
+    default_size = {"tworoom": 48, "reacher": 48, "pusht": 96, "cube": 64, "pusht_expert": 96}
     obs_size = obs_size or default_size.get(env_name, 48)
     if source is None:
-        source = "cube_replay" if env_name == "cube" else "random"
-    action_dim = _action_dim_for(env_name)
+        if env_name == "cube":
+            source = "cube_replay"
+        elif env_name == "pusht_expert":
+            source = "pusht_expert"
+        else:
+            source = "random"
+    if env_name == "pusht_expert":
+        # No real env exists for this name; use pusht's action dim (2).
+        action_dim = _action_dim_for("pusht")
+    else:
+        action_dim = _action_dim_for(env_name)
 
     spec = TrajSpec(
         env_name=env_name,
@@ -171,6 +309,8 @@ def make_dataset(
             blob = _collect_random(spec)
         elif source == "cube_replay":
             blob = _collect_cube_replay(spec)
+        elif source == "pusht_expert":
+            blob = _collect_pusht_expert(spec)
         else:
             raise ValueError(f"unknown source {source!r}")
         torch.save(blob, path)

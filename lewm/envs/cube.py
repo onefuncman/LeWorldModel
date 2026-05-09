@@ -36,17 +36,21 @@ class Cube:
         self.obs_size = obs_size
         self._env = _load_ogbench(env_only=True)
         self.action_dim = self._env.action_space.shape[0]
+        self._last_state = None
         if seed is not None:
-            self._env.reset(seed=int(seed))
+            obs, _ = self._env.reset(seed=int(seed))
+            self._last_state = np.asarray(obs, dtype=np.float32)
 
     def reset(self) -> np.ndarray:
-        self._env.reset()
+        obs, _ = self._env.reset()
+        self._last_state = np.asarray(obs, dtype=np.float32)
         return self.render()
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, bool, dict]:
         a = np.asarray(action, dtype=np.float32)
         a = np.clip(a, self._env.action_space.low, self._env.action_space.high)
-        _obs, _r, terminated, truncated, info = self._env.step(a)
+        obs, _r, terminated, truncated, info = self._env.step(a)
+        self._last_state = np.asarray(obs, dtype=np.float32)
         done = bool(terminated or truncated)
         return self.render(), done, info
 
@@ -64,23 +68,10 @@ class Cube:
         return self._env
 
     def get_state(self) -> np.ndarray:
-        """Underlying 28-dim observation vector (proprio + cube pose).
-
-        Pulled from the unwrapped env's last observation; for ogbench's
-        manipspace cube env this includes cube xyz which we use for grading.
-        """
-        # Unwrap TimeLimit, etc.; then ask the underlying env for state.
-        env = self._env
-        while hasattr(env, "env"):
-            env = env.env
-        # ogbench manipspace exposes get_state via the env's attributes;
-        # fall back to qpos[:cube_idx] if needed. Use a defensive try.
-        try:
-            s = env.unwrapped._compute_observation() if hasattr(env, "unwrapped") else env._compute_observation()
-        except Exception:
-            # Last resort: return zeros — eval will still produce a result
-            s = np.zeros(28, dtype=np.float32)
-        return np.asarray(s, dtype=np.float32)
+        """Underlying 28-dim observation vector returned by ogbench (proprio + cube pose)."""
+        if self._last_state is None:
+            raise RuntimeError("call reset() before get_state()")
+        return self._last_state.copy()
 
     def state_distance(self, goal_state: np.ndarray) -> float:
         # 28-dim state distance — coarse, but env-grounded.
