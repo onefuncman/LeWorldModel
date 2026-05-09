@@ -1,0 +1,5 @@
+torch>=2.6
+torchvision>=0.21
+numpy>=2.0
+einops>=0.8
+tqdm>=4.66
