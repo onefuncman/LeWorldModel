@@ -180,6 +180,59 @@ On a 30-epoch reacher checkpoint with recal, MPC achieves a
 **+0.35 mean state-distance reduction** (initial 0.76 → terminal 0.41,
 i.e. ~46% closer to goal on average) with 12.5% strict success.
 
+## Before increasing the training budget
+
+Our control numbers are well below the paper's. The obvious move is "train
+longer" — but throwing compute at a possibly-buggy implementation is
+wasteful. Ranked by ROI, the work below should happen first. Tier 1 can
+*invalidate* the assumption that more training will help; Tier 2 might
+already close part of the gap with no retraining.
+
+### Tier 1 — correctness checks
+1. **Verify the model can overfit a single batch.** Take 4 trajectories,
+   train 500 steps, expect pred loss ≈ 0. If it can't overfit, no budget
+   will help. ~2 min to run.
+2. **Investigate the rank-3 collapse.** Two competing hypotheses:
+   *(a)* SIGReg implementation bug — feed `N(0, I)` and a rank-3
+   "isotropic Gaussian padded with noise" through `sigreg_loss` and
+   compare. If both look small, the regularizer literally doesn't see
+   rank as a problem.
+   *(b)* The paper's regularizer is genuinely weak on these envs at
+   modest budgets. Either way knowing which is cheap and changes
+   everything.
+3. **Verify the AdaLN variant.** We implemented per-token AdaLN-Zero
+   (each token modulated by its own action). Per-token is the natural
+   fit for an autoregressive predictor with one action per token, but
+   the paper just says "AdaLN at each layer." Sequence-shared AdaLN
+   (DiT-style) is a different inductive bias. ~10 min to write the
+   alternative and compare 50-step loss curves on synthetic data.
+
+### Tier 2 — eval-side wins (no retraining needed)
+4. **Sweep CEM hyperparameters at eval time.** Currently the smoke
+   tests use 128 samples × 8 elites × 8 iters. Paper-spec is
+   300 × 30 × 30. Try the full spec and sweep `--horizon` 4/8/12/16
+   and `--replan-every` 1/2/4. Each point ~100s. The reacher result
+   (+0.35 mean state-distance reduction) is already promising — tuned
+   CEM might push it past 50% strict success without touching training.
+5. **Sweep `--success-threshold`.** Our defaults (0.08 for
+   tworoom/reacher) are arbitrary tight. Reporting curves of
+   success-rate vs threshold is more honest and lets us compare to
+   whatever number the paper actually uses.
+
+### Tier 3 — small training tweaks
+6. **Sweep SIGReg λ** (0.01, 0.1, 1.0). Paper says λ is the only
+   effective tunable knob. If λ=1.0 fixes the rank collapse we've
+   found a paper-spec hyperparameter mismatch, not a budget issue.
+7. **Increase batch size** (128 or 256). SIGReg's empirical
+   characteristic function is a sample average; small batches mean
+   noisy gradients and looser regularization. AMP makes this free.
+8. **Log effective rank during training.** Print every N steps. If
+   collapse happens at init or by step ~20, the regularizer never had
+   a chance and longer training won't recover.
+
+### Tier 4 — only after the above
+9. Increase training budget toward the paper's "hours" (~30 min/env).
+
 ## Open todos
 
 What's done so far is the **training pipeline** — encoder, predictor with
