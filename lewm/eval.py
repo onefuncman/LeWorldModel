@@ -25,6 +25,7 @@ import torch
 from .model import LeWorldModel
 from .planner import cem_plan
 from .envs import make_env
+from .probing import recalibrate_bn_from_env
 
 
 def _obs_to_tensor(obs: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -110,6 +111,7 @@ def evaluate(
     success_threshold: Optional[float] = None,
     seed: int = 0,
     verbose: bool = True,
+    bn_recal_frames: int = 1024,
 ) -> dict:
     """Run goal-reaching MPC episodes and aggregate metrics.
 
@@ -132,6 +134,17 @@ def evaluate(
         "cube":    1.0,    # 28-dim state distance
     }
     success_threshold = success_threshold or default_thresh.get(env_name, float("inf"))
+
+    # Refresh the encoder's BN running stats so eval-mode embeddings are
+    # correctly scaled (the trained running stats lag the actual feature
+    # distribution; see lewm/probing.py for the full story). Skip if the
+    # caller passes 0.
+    if bn_recal_frames > 0:
+        if verbose:
+            print(f"recalibrating BN running stats over {bn_recal_frames} fresh {env_name} frames...")
+        recalibrate_bn_from_env(
+            model, env_name, num_frames=bn_recal_frames, obs_size=obs_size, seed=seed,
+        )
 
     controller = MPCController(model, mpc_cfg)
 

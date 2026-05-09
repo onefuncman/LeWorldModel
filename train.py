@@ -11,7 +11,7 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
-from lewm import LeWMConfig, LeWorldModel, list_envs, make_dataset
+from lewm import LeWMConfig, LeWorldModel, list_envs, make_dataset, recalibrate_bn
 from lewm.data import MovingBlobDataset, SyntheticConfig
 
 
@@ -141,6 +141,20 @@ def main():
                     f"({dt:.1f}s)"
                 )
             step += 1
+
+    # BN re-cal: the encoder's BN running stats lag the actual feature
+    # distribution by end of training. Forward through the training set once
+    # in train mode (with cumulative averaging) so eval-mode users of the
+    # checkpoint get correctly-scaled embeddings without an extra pass.
+    print("recalibrating BN running stats over training set...")
+    obs_tensors = []
+    for obs, _ in loader:
+        # Reshape (B, T, C, H, W) -> (B*T, C, H, W); recal cares about per-frame stats
+        obs_tensors.append(obs.reshape(-1, *obs.shape[2:]))
+        if sum(t.shape[0] for t in obs_tensors) >= 4096:
+            break
+    recal_obs = torch.cat(obs_tensors, dim=0)[:4096].to(device)
+    recalibrate_bn(model, recal_obs)
 
     import os
     ckpt = args.ckpt or f"checkpoints/lewm_{args.env}.pt"

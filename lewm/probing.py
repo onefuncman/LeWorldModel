@@ -120,7 +120,7 @@ def collect_probe_dataset(
 
 
 @torch.no_grad()
-def _bn_recalibrate(model: LeWorldModel, obs: np.ndarray, batch_size: int = 256) -> None:
+def recalibrate_bn(model: LeWorldModel, obs: np.ndarray, batch_size: int = 256) -> None:
     """Refresh BN running stats by forwarding through `obs` in train mode.
 
     The encoder's projector uses BatchNorm1d with affine=False. The running
@@ -130,6 +130,8 @@ def _bn_recalibrate(model: LeWorldModel, obs: np.ndarray, batch_size: int = 256)
     representative sample of obs in train mode resets the running stats to
     the current model's actual feature distribution; subsequent eval-mode
     calls then produce well-scaled embeddings.
+
+    Accepts either a uint8 (N, H, W, 3) array or a float (N, 3, H, W) tensor.
     """
     device = next(model.parameters()).device
     # Reset running stats to a clean state, then accumulate fresh ones.
@@ -141,13 +143,37 @@ def _bn_recalibrate(model: LeWorldModel, obs: np.ndarray, batch_size: int = 256)
     n = obs.shape[0]
     for s in range(0, n, batch_size):
         chunk = obs[s : s + batch_size]
-        t = torch.from_numpy(chunk).float().permute(0, 3, 1, 2) / 255.0
+        if isinstance(chunk, np.ndarray):
+            t = torch.from_numpy(chunk).float().permute(0, 3, 1, 2) / 255.0
+        else:
+            t = chunk
         model.encoder(t.to(device))
     # Restore default momentum and switch back to eval mode for downstream use
     for m in model.modules():
         if isinstance(m, torch.nn.BatchNorm1d):
             m.momentum = 0.1
     model.eval()
+
+
+@torch.no_grad()
+def recalibrate_bn_from_env(
+    model: LeWorldModel,
+    env_name: str,
+    num_frames: int = 1024,
+    obs_size: int | None = None,
+    episode_len: int = 32,
+    seed: int = 0,
+) -> None:
+    """Run BN recalibration using fresh random rollouts in `env_name`.
+
+    Convenience wrapper for eval/CEM call sites that don't already have a
+    cached observation buffer on hand.
+    """
+    blob = collect_probe_dataset(
+        env_name, num_frames=num_frames, obs_size=obs_size,
+        seed=seed, episode_len=episode_len,
+    )
+    recalibrate_bn(model, blob["obs"])
 
 
 @torch.no_grad()
@@ -246,7 +272,7 @@ def probe(
     state = blob["state"]
 
     print(f"  recalibrating BN running stats over probe set...")
-    _bn_recalibrate(model, obs)
+    recalibrate_bn(model, obs)
     print(f"  encoding {obs.shape[0]} frames...")
     z = _encode_all(model, obs)            # (N, D), CPU
     y = torch.from_numpy(state).float()    # (N, state_dim), CPU

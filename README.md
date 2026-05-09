@@ -160,9 +160,25 @@ Two takeaways:
    has nothing to learn.
 
 A note on BN: the encoder's 1-layer-MLP+BatchNorm projector has stale
-running mean/var after training (eval-mode std=4 vs trained std=1). The
-probe pipeline does a brief BN re-cal pass before encoding to fix this.
-Eval/CEM will hit the same issue and should probably do the same.
+running mean/var after training (eval-mode std=4 vs trained std=1). All
+three downstream tools fix this:
+- `train.py` does a recal pass over the training set as the last step,
+  so saved checkpoints have correct running stats.
+- `eval.py` does a recal pass on fresh random rollouts at load time
+  (configurable via `--bn-recal-frames`, default 1024).
+- `probe.py` recalibrates against the probe set itself.
+
+The recal helps eval substantially. On a 30-epoch tworoom checkpoint:
+
+| metric                        | without recal | with recal |
+|-------------------------------|---------------|------------|
+| MPC success rate (8 ep)       | 0%            | **12.5%**  |
+| mean state-distance reduction | -0.06 (hurts) | **+0.02**  |
+| mean terminal latent distance | 660           | 196        |
+
+On a 30-epoch reacher checkpoint with recal, MPC achieves a
+**+0.35 mean state-distance reduction** (initial 0.76 → terminal 0.41,
+i.e. ~46% closer to goal on average) with 12.5% strict success.
 
 ## Open todos
 
@@ -190,6 +206,14 @@ end-to-end smoke test. What's still missing relative to the paper:
   Diffusion-Policy's `pusht.zip` (~31 MB), normalizes the action range to
   [-1, 1], and slides 16-step windows. Probing shows it's substantially
   better than the random-rollout `pusht`.
+- [ ] **Push-T action-modality mismatch**: the expert dataset's actions
+  are *target end-effector positions* (DP's control mode), but our
+  `lewm/envs/pusht.py` treats actions as *velocity commands*. So a model
+  trained on `pusht_expert` and evaluated against our `pusht` env doesn't
+  steer correctly — CEM finds plans that look fine in latent space but the
+  env interprets them differently. To close this gap, switch our pusht env
+  to position-command control (matching DP's reference) or convert the
+  expert action stream into velocities before normalization.
 - [ ] Custom Two-Room and Reacher envs are minimal-but-faithful shapes /
   dynamics and won't byte-match any specific reference implementation. (No
   public LeWM-released datasets are known for these.)

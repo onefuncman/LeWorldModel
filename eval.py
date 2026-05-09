@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cem-elites", type=int, default=30)
     p.add_argument("--cem-iters", type=int, default=30)
     p.add_argument("--success-threshold", type=float, default=None)
+    p.add_argument("--bn-recal-frames", type=int, default=1024,
+                   help="frames used to refresh BN running stats at load (0 to skip)")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
@@ -71,6 +73,7 @@ def main():
         mpc_cfg=mpc,
         success_threshold=args.success_threshold,
         seed=args.seed,
+        bn_recal_frames=args.bn_recal_frames,
     )
     print()
     print(f"=== {env_name} ({args.episodes} episodes, {time.time()-t0:.1f}s total) ===")
