@@ -139,15 +139,16 @@ How well does the frozen encoder's latent decode env state? We collect 4096
 random-rollout (obs, state) pairs per env, encode, then fit ridge linear and
 2-layer MLP regressors to env state on an 80/20 split.
 
-| env            | embed dim | effective rank | linear R² | MLP R² | notes |
-|----------------|-----------|----------------|-----------|--------|-------|
-| `tworoom`      | 320       | 2.8            | -0.58     | +0.02  | severely collapsed; encoder reduces to ~"which room am I in" |
-| `reacher`      | 320       | 4.5            | -30.3     | **+0.55** | tip position recoverable nonlinearly |
-| `pusht`        | 320       | 3.4            | -1.63     | +0.22  | random-rollout data is too weak — agent rarely contacts the T |
-| `pusht_expert` | 320       | **6.6**        | **+0.44** | **+0.60** | expert demonstrations dramatically improve representation |
-| `cube`         | 320       | 4.0            | -0.38     | +0.27  | 24 of 28 state dims (4 are constant) |
+| env                | embed dim | effective rank | linear R² | MLP R² | notes |
+|--------------------|-----------|----------------|-----------|--------|-------|
+| `tworoom`          | 320       | 2.8            | -0.58     | +0.02  | severely collapsed; encoder reduces to ~"which room am I in" |
+| `reacher`          | 320       | 4.5            | -30.3     | **+0.55** | tip position recoverable nonlinearly |
+| `pusht` (vel-conv) | 320       | 3.4            | -1.63     | +0.22  | random-rollout data is too weak — agent rarely contacts the T |
+| `pusht_expert` (vel-conv) | 320 | 6.6          | +0.44     | +0.60  | pre-action-modality fix; baseline before position-command alignment |
+| `pusht_expert` (pos-conv) | 320 | **10.7**     | +0.27     | +0.15  | post-fix; eff_rank up but block-state probe drops — see note below |
+| `cube`             | 320       | 4.0            | -0.38     | +0.27  | 24 of 28 state dims (4 are constant) |
 
-Two takeaways:
+Three takeaways:
 1. **Effective rank is consistently far below the embed dim.** SIGReg keeps
    each random-projection's marginal Gaussian, but with M=1024 random
    directions on S^319, the rank-3-to-7 informative subspace is sampled
@@ -157,10 +158,26 @@ Two takeaways:
    finding worth flagging — the regularizer alone doesn't prevent
    dimensional collapse on these envs at our training budgets.
 2. **Data quality matters enormously.** Switching from random rollouts to
-   real expert demonstrations on Push-T roughly doubles effective rank,
-   pushes linear R² from negative to +0.44, and triples MLP R² (0.22→0.60).
-   Random actions in contact-rich envs are mostly no-ops; the world model
-   has nothing to learn.
+   real expert demonstrations on Push-T roughly doubles effective rank
+   (3.4 → 6.6 with vel-conv, → 10.7 with pos-conv), and pushes linear R²
+   from negative to positive. Random actions in contact-rich envs are
+   mostly no-ops; the world model has nothing to learn.
+3. **Action-modality alignment raises rank but lowers block-state
+   probe R².** After switching to position-command (matching the expert
+   data), eff_rank rises 6.6 → 10.7 — the action-aligned data lets the
+   predictor extract more structure, pushing the encoder to use more
+   dimensions. But linear R² drops 0.44 → 0.27 and MLP R² drops 0.60 →
+   0.15. Likely cause: under position-command, U(-1,1) random actions
+   teleport-track the agent between random world targets; the agent
+   rarely lines up to push the T, so probe data has block-state ≈ spawn
+   distribution with very few contact-induced configurations. The
+   encoder was trained on smooth expert pushes; at probe time it sees a
+   different state distribution where block dynamics are nearly absent.
+   This is a probe-data confound, not necessarily a representation
+   regression — confirm by re-probing on expert obs windows or adding a
+   block-only probe distribution. Top-5 singular values [384, 194, 122,
+   18, 13] show a clear elbow at K=3 (block has 3 state dims) plus
+   weaker tail capacity.
 
 A note on BN: the encoder's 1-layer-MLP+BatchNorm projector has stale
 running mean/var after training (eval-mode std=4 vs trained std=1). All
