@@ -5,6 +5,7 @@ from .model import LeWorldModel, LeWMConfig
 from .planner import cem_plan
 from .datasets import make_dataset, TrajectoryDataset
 from .envs import make_env, list_envs
+from .eval import MPCController, MPCConfig, evaluate
 
 __all__ = [
     "ViTEncoder",
@@ -17,4 +18,7 @@ __all__ = [
     "TrajectoryDataset",
     "make_env",
     "list_envs",
+    "MPCController",
+    "MPCConfig",
+    "evaluate",
 ]

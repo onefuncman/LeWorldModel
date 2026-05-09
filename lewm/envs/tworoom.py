@@ -81,6 +81,13 @@ class TwoRoom:
         img[mask] = (200, 60, 60)
         return img
 
+    def get_state(self) -> np.ndarray:
+        """Underlying state for eval: agent (x, y) in [0, 1]."""
+        return self.pos.copy()
+
+    def state_distance(self, goal_state: np.ndarray) -> float:
+        return float(np.linalg.norm(self.pos - np.asarray(goal_state)))
+
 
 @register("tworoom")
 def _make(obs_size: int = 48, seed: int | None = None) -> TwoRoom:

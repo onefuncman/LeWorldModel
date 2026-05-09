@@ -43,12 +43,14 @@ lewm/
   planner.py    CEM planner over latent rollouts
   data.py       MovingBlobDataset — synthetic toy trajectories for smoke tests
   datasets.py   make_dataset(name, ...) — real-env trajectory datasets
+  eval.py       MPC controller + evaluate(): goal-reaching control eval
   envs/
     tworoom.py  2D nav with two rooms + doorway (custom)
     reacher.py  2-link planar arm (custom kinematics)
     pusht.py    Push-T via pymunk physics
     cube.py     OGBench cube-single-play-v0 wrapper
 train.py        Training entry point with --env flag
+eval.py         Control-evaluation entry point (loads checkpoint, runs MPC)
 smoke_test.py   End-to-end pipeline check (a few training steps + one CEM call)
 requirements.txt
 ```
@@ -76,13 +78,21 @@ For CPU-only, drop the `--index-url` flag (PyPI default is CPU build).
 .venv\Scripts\python.exe train.py --env synthetic --epochs 5
 
 # Train on a real env (collects trajectories on first run, caches under ./data/)
-.venv\Scripts\python.exe train.py --env tworoom --epochs 5 --num-trajs 512
-.venv\Scripts\python.exe train.py --env reacher --epochs 5 --num-trajs 512
-.venv\Scripts\python.exe train.py --env pusht   --epochs 5 --num-trajs 256
-.venv\Scripts\python.exe train.py --env cube    --epochs 5 --num-trajs 128
+.venv\Scripts\python.exe train.py --env tworoom --epochs 8 --num-trajs 512
+.venv\Scripts\python.exe train.py --env reacher --epochs 8 --num-trajs 512
+.venv\Scripts\python.exe train.py --env pusht   --epochs 8 --num-trajs 256
+.venv\Scripts\python.exe train.py --env cube    --epochs 8 --num-trajs 128
+
+# Evaluate goal-reaching with MPC + CEM
+.venv\Scripts\python.exe eval.py --ckpt checkpoints/lewm_tworoom.pt --episodes 8
 ```
 
-The smoke test exercises the full pipeline (forward, backward, AdaLN, SIGReg, CEM).
+The smoke test exercises the full training pipeline (forward, backward, AdaLN,
+SIGReg, CEM). `eval.py` loads a trained checkpoint and runs receding-horizon
+MPC: at each step it plans `--horizon` actions in latent space, executes the
+first `--replan-every`, observes the new frame, then replans. Per-episode
+output reports state-distance start→end, latent-space distance to goal, and
+pixel MSE.
 
 ## Environments
 
@@ -112,21 +122,51 @@ First run for `cube` will download the ogbench dataset (~270 MB) under
 all configurable via `LeWMConfig`. SIGReg uses M=1024 random projections, 32
 quadrature nodes on [0.2, 4], bandwidth 1, λ = 0.1.
 
-## Status — what's stubbed
+## Open todos
 
-- All four paper environments are now implemented (see table above). Two-Room
-  and Reacher are pure-Python customs; Push-T uses `pymunk`; Cube wraps the
-  upstream `ogbench` env. Custom envs are minimal-but-faithful shapes/dynamics
-  and won't byte-match any specific reference implementation.
-- For Two-Room, Reacher, and Push-T, training data is collected with a random
-  policy on first run rather than downloaded. (No public LeWM-released
-  datasets are known for these envs.) Cube uses ogbench's published action
-  stream, replayed in-env to re-render pixels.
-- Some hyperparameters not specified in the paper abstract (LR, batch size,
-  exact resolutions per env) use reasonable defaults: AdamW, lr 3e-4, wd 0.05.
-  `train.py` auto-adjusts `patch_size` if `img_size` isn't divisible by 14.
-- Image-space probing / violation-of-expectation evaluation from the paper
-  is not implemented.
+What's done so far is the **training pipeline** — encoder, predictor with
+AdaLN-Zero, SIGReg, the four envs, datasets, the CEM planner, and a
+end-to-end smoke test. What's still missing relative to the paper:
+
+### Evaluation / control
+- [x] **Control evaluation loop with MPC.** `lewm/eval.py` + `eval.py` CLI
+  reset the env, encode a goal observation, run receding-horizon MPC over CEM,
+  and report success rate / state-distance reduction / terminal latent
+  distance. Tuning of CEM / horizon hyperparameters per env is still open.
+- [x] **Per-env success criteria.** Each env exposes `get_state()` and
+  `state_distance(goal_state)` (tworoom: 2D position; reacher: tip xy; pusht:
+  block (x,y,θ); cube: 28-dim ogbench state).
+- [ ] **Probing experiments.** The paper validates that the latent encodes
+  physical structure via linear/MLP regression of physical quantities
+  (positions, velocities). Not implemented.
+- [ ] **Violation-of-expectation surprise detection.** The paper detects
+  physically implausible events via the predictor's residual. Not implemented.
+
+### Data faithfulness
+- [ ] **Real Push-T expert data.** Diffusion-Policy's released
+  `pusht_cchi_v7_replay.zarr.zip` is the canonical Push-T offline dataset; we
+  use random rollouts instead. A downloader/converter into our trajectory
+  format would close this gap.
+- [ ] Custom Two-Room and Reacher envs are minimal-but-faithful shapes /
+  dynamics and won't byte-match any specific reference implementation. (No
+  public LeWM-released datasets are known for these.)
+
+### Engineering / training quality-of-life
+- [ ] **Mixed precision (AMP).** Would speed up training meaningfully on the
+  3070; not yet wired up.
+- [ ] **wandb / TensorBoard logging.** Currently just `print` to stdout.
+- [ ] **Multi-GPU / DDP.** Single-GPU only.
+- [ ] **KV caching in `LeWorldModel.rollout_latent`.** Each CEM step re-runs
+  the full predictor (O(t²) for t-step rollouts). Fine for short horizons,
+  slow for long ones. KV caching would make CEM with H>>10 tractable.
+- [ ] **Streaming / num_workers > 0 data pipeline.** Datasets currently sit
+  in CPU memory as uint8; fine at our sizes, would need work for larger.
+
+### Hyperparameters
+- The paper abstract doesn't pin down LR, batch size, or exact image
+  resolutions per env. We use AdamW, lr 3e-4, wd 0.05 and the resolutions
+  shown in the env table. `train.py` auto-adjusts `patch_size` if `img_size`
+  isn't divisible by 14.
 
 ## Reference
 

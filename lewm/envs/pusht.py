@@ -110,6 +110,19 @@ class PushT:
 
         return self.render(), False, {}
 
+    def get_state(self) -> np.ndarray:
+        """Block (x, y, angle) in world coords."""
+        bx, by = self.block.position
+        return np.array([float(bx), float(by), float(self.block.angle)], dtype=np.float32)
+
+    def state_distance(self, goal_state: np.ndarray) -> float:
+        s = self.get_state()
+        g = np.asarray(goal_state, dtype=np.float32)
+        # Position error in world units + angular error scaled
+        pos_err = float(np.linalg.norm(s[:2] - g[:2]))
+        ang_err = float(abs((s[2] - g[2] + math.pi) % (2 * math.pi) - math.pi))
+        return pos_err + 50.0 * ang_err  # mix; angle weighted to make ~comparable
+
     def render(self) -> np.ndarray:
         # Render to large canvas then downsample for anti-aliasing.
         big = 256

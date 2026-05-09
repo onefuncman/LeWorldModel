@@ -70,6 +70,15 @@ class Reacher:
         _draw_disk(img, base, 0.018, (40, 40, 40))   # base
         return img
 
+    def get_state(self) -> np.ndarray:
+        """Underlying state for eval: tip (x, y) in canvas coords [0, 1]."""
+        _, _, tip = self._endpoints()
+        return tip.copy()
+
+    def state_distance(self, goal_state: np.ndarray) -> float:
+        _, _, tip = self._endpoints()
+        return float(np.linalg.norm(tip - np.asarray(goal_state)))
+
 
 def _to_px(p: np.ndarray, S: int) -> tuple[int, int]:
     return int(round(p[0] * S)), int(round((1.0 - p[1]) * S))  # flip y for image
