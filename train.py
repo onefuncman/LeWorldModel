@@ -1,7 +1,8 @@
 """LeWorldModel training entry point.
 
 Usage:
-    .venv/Scripts/python.exe train.py --epochs 5 --batch-size 32
+    .venv/Scripts/python.exe train.py --env tworoom --epochs 5 --batch-size 32
+    .venv/Scripts/python.exe train.py --env synthetic --epochs 5
 """
 from __future__ import annotations
 
@@ -10,25 +11,64 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
-from lewm import LeWMConfig, LeWorldModel
+from lewm import LeWMConfig, LeWorldModel, list_envs, make_dataset
 from lewm.data import MovingBlobDataset, SyntheticConfig
+
+
+# Sensible per-env defaults if user doesn't override.
+ENV_DEFAULTS = {
+    "tworoom":   {"obs_size": 48, "seq_len": 16, "num_trajs": 512},
+    "reacher":   {"obs_size": 48, "seq_len": 16, "num_trajs": 512},
+    "pusht":     {"obs_size": 96, "seq_len": 16, "num_trajs": 256},
+    "cube":      {"obs_size": 64, "seq_len": 16, "num_trajs": 128},
+    "synthetic": {"obs_size": 56, "seq_len": 8,  "num_trajs": 1024},
+}
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+    p.add_argument("--env", type=str, default="synthetic",
+                   choices=list_envs() + ["synthetic"],
+                   help="env to train on (default: synthetic moving blob)")
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
-    p.add_argument("--seq-len", type=int, default=8)
-    p.add_argument("--img-size", type=int, default=56)
-    p.add_argument("--num-trajs", type=int, default=1024)
+    p.add_argument("--seq-len", type=int, default=None)
+    p.add_argument("--img-size", type=int, default=None, help="override env obs_size")
+    p.add_argument("--num-trajs", type=int, default=None)
     p.add_argument("--sigreg-lambda", type=float, default=0.1)
     p.add_argument("--sigreg-projections", type=int, default=1024)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--ckpt", type=str, default="checkpoints/lewm.pt")
+    p.add_argument("--ckpt", type=str, default=None)
     return p.parse_args()
+
+
+def build_dataset(args):
+    """Either the synthetic moving-blob dataset or one of the four real envs."""
+    defaults = ENV_DEFAULTS[args.env]
+    obs_size = args.img_size or defaults["obs_size"]
+    seq_len = args.seq_len or defaults["seq_len"]
+    num_trajs = args.num_trajs or defaults["num_trajs"]
+
+    if args.env == "synthetic":
+        cfg = SyntheticConfig(
+            img_size=obs_size,
+            seq_len=seq_len,
+            num_trajectories=num_trajs,
+        )
+        return MovingBlobDataset(cfg, seed=args.seed), obs_size, seq_len, cfg.action_dim
+
+    ds = make_dataset(
+        env_name=args.env,
+        num_trajectories=num_trajs,
+        seq_len=seq_len,
+        obs_size=obs_size,
+        seed=args.seed,
+    )
+    action_dim = ds.actions.shape[-1]
+    return ds, obs_size, seq_len, action_dim
 
 
 def main():
@@ -36,12 +76,7 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    data_cfg = SyntheticConfig(
-        img_size=args.img_size,
-        seq_len=args.seq_len,
-        num_trajectories=args.num_trajs,
-    )
-    train_set = MovingBlobDataset(data_cfg, seed=args.seed)
+    train_set, obs_size, seq_len, action_dim = build_dataset(args)
     loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -49,17 +84,28 @@ def main():
         num_workers=0,
         drop_last=True,
     )
+    print(f"env={args.env}  obs={obs_size}x{obs_size}  T={seq_len}  A={action_dim}  N={len(train_set)}")
 
     cfg = LeWMConfig(
-        img_size=args.img_size,
-        action_dim=data_cfg.action_dim,
+        img_size=obs_size,
+        action_dim=action_dim,
         sigreg_lambda=args.sigreg_lambda,
         sigreg_projections=args.sigreg_projections,
-        max_seq_len=max(64, args.seq_len + 8),
+        max_seq_len=max(64, seq_len + 8),
     )
+    # If obs_size isn't divisible by patch_size, fall back to a smaller patch.
+    if cfg.img_size % cfg.patch_size != 0:
+        for p in (16, 12, 8, 4):
+            if cfg.img_size % p == 0:
+                cfg.patch_size = p
+                break
+        else:
+            raise ValueError(f"cannot find patch_size dividing img_size={cfg.img_size}")
+        print(f"[adjusted] patch_size -> {cfg.patch_size} (img_size={cfg.img_size})")
+
     model = LeWorldModel(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"trainable params: {n_params/1e6:.2f}M  (encoder + predictor)")
+    print(f"trainable params: {n_params/1e6:.2f}M")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -88,9 +134,10 @@ def main():
             step += 1
 
     import os
-    os.makedirs(os.path.dirname(args.ckpt) or ".", exist_ok=True)
-    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__}, args.ckpt)
-    print(f"saved checkpoint -> {args.ckpt}")
+    ckpt = args.ckpt or f"checkpoints/lewm_{args.env}.pt"
+    os.makedirs(os.path.dirname(ckpt) or ".", exist_ok=True)
+    torch.save({"model": model.state_dict(), "cfg": cfg.__dict__, "env": args.env}, ckpt)
+    print(f"saved checkpoint -> {ckpt}")
 
 
 if __name__ == "__main__":

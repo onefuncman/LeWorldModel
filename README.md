@@ -42,7 +42,13 @@ lewm/
   model.py      LeWorldModel (forward + two-term loss) and LeWMConfig
   planner.py    CEM planner over latent rollouts
   data.py       MovingBlobDataset — synthetic toy trajectories for smoke tests
-train.py        Training entry point
+  datasets.py   make_dataset(name, ...) — real-env trajectory datasets
+  envs/
+    tworoom.py  2D nav with two rooms + doorway (custom)
+    reacher.py  2-link planar arm (custom kinematics)
+    pusht.py    Push-T via pymunk physics
+    cube.py     OGBench cube-single-play-v0 wrapper
+train.py        Training entry point with --env flag
 smoke_test.py   End-to-end pipeline check (a few training steps + one CEM call)
 requirements.txt
 ```
@@ -63,12 +69,34 @@ For CPU-only, drop the `--index-url` flag (PyPI default is CPU build).
 ## Run
 
 ```powershell
+# Pipeline smoke test (synthetic data, < 1s on GPU)
 .venv\Scripts\python.exe smoke_test.py
-.venv\Scripts\python.exe train.py --epochs 5 --batch-size 32
+
+# Train on the synthetic moving-blob dataset (no env deps needed)
+.venv\Scripts\python.exe train.py --env synthetic --epochs 5
+
+# Train on a real env (collects trajectories on first run, caches under ./data/)
+.venv\Scripts\python.exe train.py --env tworoom --epochs 5 --num-trajs 512
+.venv\Scripts\python.exe train.py --env reacher --epochs 5 --num-trajs 512
+.venv\Scripts\python.exe train.py --env pusht   --epochs 5 --num-trajs 256
+.venv\Scripts\python.exe train.py --env cube    --epochs 5 --num-trajs 128
 ```
 
-Smoke test exercises the full pipeline (forward, backward, AdaLN, SIGReg, CEM)
-on a tiny config in under a second on GPU.
+The smoke test exercises the full pipeline (forward, backward, AdaLN, SIGReg, CEM).
+
+## Environments
+
+| name       | source                              | obs default | action dim | data source                                  |
+|------------|-------------------------------------|-------------|------------|----------------------------------------------|
+| `tworoom`  | custom 2D nav (this repo)           | 48 x 48     | 2          | random-policy rollouts collected on first run |
+| `reacher`  | custom 2-link arm (this repo)       | 48 x 48     | 2          | random-policy rollouts collected on first run |
+| `pusht`    | `pymunk` physics, T-shaped block    | 96 x 96     | 2          | random-policy rollouts collected on first run |
+| `cube`     | `ogbench` `cube-single-play-v0`     | 64 x 64     | 5          | OGBench's released action stream replayed in env, frames re-rendered |
+| `synthetic`| `lewm.data.MovingBlobDataset`       | 56 x 56     | 2          | analytic moving-blob trajectories (no env)    |
+
+Datasets are cached under `./data/{env}_{source}_n{N}_T{T}_S{S}_seed{seed}.pt`.
+First run for `cube` will download the ogbench dataset (~270 MB) under
+`~/.ogbench/data/`; subsequent runs reuse it.
 
 ## Default config
 
@@ -86,14 +114,17 @@ quadrature nodes on [0.2, 4], bandwidth 1, λ = 0.1.
 
 ## Status — what's stubbed
 
-- The four paper environments (Push-T, OGBench-Cube, Two-Room, Reacher) are
-  **not** wired up. `lewm/data.py` ships a synthetic `MovingBlobDataset`
-  sufficient to verify the pipeline trains and CEM plans coherent action
-  sequences. To use a real env, write a `Dataset` that returns
-  `(obs: (T, C, H, W), actions: (T-1, A))` and swap it into `train.py`.
+- All four paper environments are now implemented (see table above). Two-Room
+  and Reacher are pure-Python customs; Push-T uses `pymunk`; Cube wraps the
+  upstream `ogbench` env. Custom envs are minimal-but-faithful shapes/dynamics
+  and won't byte-match any specific reference implementation.
+- For Two-Room, Reacher, and Push-T, training data is collected with a random
+  policy on first run rather than downloaded. (No public LeWM-released
+  datasets are known for these envs.) Cube uses ogbench's published action
+  stream, replayed in-env to re-render pixels.
 - Some hyperparameters not specified in the paper abstract (LR, batch size,
-  exact resolutions per env) use reasonable defaults: AdamW, lr 3e-4, wd 0.05,
-  `img_size=56` (must be a multiple of `patch_size=14`).
+  exact resolutions per env) use reasonable defaults: AdamW, lr 3e-4, wd 0.05.
+  `train.py` auto-adjusts `patch_size` if `img_size` isn't divisible by 14.
 - Image-space probing / violation-of-expectation evaluation from the paper
   is not implemented.
 
