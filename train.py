@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-trajs", type=int, default=None)
     p.add_argument("--sigreg-lambda", type=float, default=0.1)
     p.add_argument("--sigreg-projections", type=int, default=1024)
+    p.add_argument("--pred-dim", type=int, default=None,
+                   help="override predictor/encoder out dim (default: LeWMConfig default = 320)")
+    p.add_argument("--pred-heads", type=int, default=None,
+                   help="override predictor heads (default: LeWMConfig default = 16)")
+    p.add_argument("--log-rank-every", type=int, default=100,
+                   help="log effective rank of encoder embeddings every N steps (0 to disable)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--ckpt", type=str, default=None)
@@ -89,13 +95,19 @@ def main():
     )
     print(f"env={args.env}  obs={obs_size}x{obs_size}  T={seq_len}  A={action_dim}  N={len(train_set)}")
 
-    cfg = LeWMConfig(
+    cfg_kwargs = dict(
         img_size=obs_size,
         action_dim=action_dim,
         sigreg_lambda=args.sigreg_lambda,
         sigreg_projections=args.sigreg_projections,
         max_seq_len=max(64, seq_len + 8),
     )
+    if args.pred_dim is not None:
+        cfg_kwargs["pred_dim"] = args.pred_dim
+        cfg_kwargs["action_emb_dim"] = args.pred_dim
+    if args.pred_heads is not None:
+        cfg_kwargs["pred_heads"] = args.pred_heads
+    cfg = LeWMConfig(**cfg_kwargs)
     # If obs_size isn't divisible by patch_size, fall back to a smaller patch.
     if cfg.img_size % cfg.patch_size != 0:
         for p in (16, 12, 8, 4):
@@ -133,13 +145,23 @@ def main():
 
             if step % 20 == 0:
                 dt = time.time() - t0
-                print(
+                msg = (
                     f"epoch {epoch:02d} step {step:05d}  "
                     f"loss {out['loss'].item():.4f}  "
                     f"pred {out['pred_loss'].item():.4f}  "
-                    f"sigreg {out['sigreg'].item():.4f}  "
-                    f"({dt:.1f}s)"
+                    f"sigreg {out['sigreg'].item():.4f}"
                 )
+                if args.log_rank_every and step % args.log_rank_every == 0:
+                    with torch.no_grad():
+                        z_flat = out["z"].detach().reshape(-1, out["z"].shape[-1]).float()
+                        zc = z_flat - z_flat.mean(dim=0, keepdim=True)
+                        sv = torch.linalg.svdvals(zc)
+                        p = sv / sv.sum().clamp_min(1e-8)
+                        p = p[p > 1e-12]
+                        eff_rank = float(torch.exp(-(p * p.log()).sum()).item())
+                    msg += f"  eff_rank {eff_rank:.2f}"
+                msg += f"  ({dt:.1f}s)"
+                print(msg)
             step += 1
 
     # BN re-cal: the encoder's BN running stats lag the actual feature

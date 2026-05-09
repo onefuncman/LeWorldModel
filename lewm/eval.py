@@ -214,9 +214,13 @@ def evaluate(
         "success_rate": float(np.mean([e.success for e in episodes])) if episodes else 0.0,
         "mean_terminal_latent_dist": float(np.mean([e.terminal_latent_dist for e in episodes])),
         "mean_pixel_mse_terminal": float(np.mean([e.pixel_mse_terminal for e in episodes])),
+        "per_episode_terminal_latent_dist": [e.terminal_latent_dist for e in episodes],
+        "per_episode_pixel_mse_terminal": [e.pixel_mse_terminal for e in episodes],
     }
     if all(e.terminal_state_dist is not None for e in episodes):
         out["mean_terminal_state_dist"] = float(np.mean([e.terminal_state_dist for e in episodes]))
         out["mean_initial_state_dist"] = float(np.mean([e.initial_state_dist for e in episodes]))
         out["mean_state_dist_reduction"] = out["mean_initial_state_dist"] - out["mean_terminal_state_dist"]
+        out["per_episode_terminal_state_dist"] = [e.terminal_state_dist for e in episodes]
+        out["per_episode_initial_state_dist"] = [e.initial_state_dist for e in episodes]
     return out
