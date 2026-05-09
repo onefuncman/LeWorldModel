@@ -188,10 +188,10 @@ wasteful. Ranked by ROI, the work below should happen first. Tier 1 can
 *invalidate* the assumption that more training will help; Tier 2 might
 already close part of the gap with no retraining.
 
-### Tier 1 — correctness checks
+### Tier 1 — correctness checks (run; results below)
 1. **Verify the model can overfit a single batch.** Take 4 trajectories,
    train 500 steps, expect pred loss ≈ 0. If it can't overfit, no budget
-   will help. ~2 min to run.
+   will help. ~2 min to run. **(`diagnostics/overfit_batch.py`)**
 2. **Investigate the rank-3 collapse.** Two competing hypotheses:
    *(a)* SIGReg implementation bug — feed `N(0, I)` and a rank-3
    "isotropic Gaussian padded with noise" through `sigreg_loss` and
@@ -199,13 +199,125 @@ already close part of the gap with no retraining.
    rank as a problem.
    *(b)* The paper's regularizer is genuinely weak on these envs at
    modest budgets. Either way knowing which is cheap and changes
-   everything.
+   everything. **(`diagnostics/sigreg_rank.py`)**
 3. **Verify the AdaLN variant.** We implemented per-token AdaLN-Zero
    (each token modulated by its own action). Per-token is the natural
    fit for an autoregressive predictor with one action per token, but
    the paper just says "AdaLN at each layer." Sequence-shared AdaLN
    (DiT-style) is a different inductive bias. ~10 min to write the
    alternative and compare 50-step loss curves on synthetic data.
+   **(`diagnostics/adaln_variant.py`)**
+
+### Tier 1 results
+
+**1. Single-batch overfit — PASS.** On a fixed 4-trajectory batch, pred_loss
+crashes from 1.96 → 0.0008 in 500 steps (~2400× reduction, 35s on RTX 3070).
+Architecture and gradient flow are sound; the model is not bottlenecked by
+inability to fit. Eval-mode pred_loss is 0.004 (vs 0.001 train-mode) due to
+the BN running-stat lag we've already documented — not a new issue.
+
+**2. SIGReg rank-collapse probe — found the smoking gun.** The regularizer
+literally cannot see rank collapse when the encoder pads dead dims with iid
+noise. With M=1024 random unit-norm directions on S^319, sigreg readings:
+
+| distribution                                     | eff. rank | sigreg          |
+|--------------------------------------------------|-----------|-----------------|
+| full-rank N(0, I_320)                            | 288       | **0.00057**     |
+| rank-3 signal padded with N(0,1) noise, BN'd     | 289       | **0.00056**     |
+| rank-8 signal padded with N(0,1) noise, BN'd     | 288       | **0.00056**     |
+| rank-3 signal, zero-padded, BN'd                 | 3.00      | 0.0364 (65× ↑)  |
+| rank-1 signal, zero-padded, BN'd                 | 1.00      | 0.0883 (158× ↑) |
+| N(0, I_320) but dim 0 scaled 5x                  | 285       | 0.00166 (3× ↑)  |
+
+The rank-3 *padded with noise* row is **indistinguishable from full-rank
+Gaussian**, while rank-3 *zero-padded* spikes 65×. The takeaway: SIGReg + per-dim
+BN admits a "noise-pad" loophole — the encoder can keep all useful information
+in K << D dims and route iid noise through the rest, satisfying every 1D
+marginal under random projections while the joint distribution stays low-rank.
+Random projections sample the K-dim informative subspace at rate K/D, which is
+~1% for K=3, D=320 — too rare for the projected Epps–Pulley statistic to fire.
+Our trained encoders' sigreg of ~0.07-0.10 sits between rank-3 zero-pad (0.036)
+and rank-1 zero-pad (0.088), suggesting actual encoders use a mix of low-rank
+structure plus residual non-Gaussian features (heavy tails, multimodality)
+beyond pure rank.
+
+**Why this is structural, not a bug.** The mechanism is geometric. A random
+unit vector u ∈ S^(D−1) has E[u_i²] = 1/D, so a projection u·z splits energy
+as ≈ K/D onto a K-dim informative subspace and (D−K)/D onto everything else.
+With BN forcing each dim to unit variance, the (D−K) noise-pad coordinates
+sum to a CLT-Gaussian-looking quantity that dominates the projection.
+Non-Gaussianity in the K signal dims is suppressed in the projection by
+~√(K/D) ≈ 0.1 for K=3, D=320; higher-moment detectors suppress it further.
+Each individual component of the loss is doing what it's specified to do
+(BN: per-dim moment match; SIGReg: 1D-marginal Gaussianity). The loophole
+lives in what they jointly *don't* constrain: joint covariance. The paper's
+two-term loss is underspecified for representations whose downstream use is
+L2-distance-based (CEM cost = ‖z − z_g‖² across all D dims), not wrong.
+
+**Why this matters for control.** CEM's planning cost is `‖z_pred(actions) −
+z_goal‖²` summed across all D=320 dims. With K useful dims and D−K noise-pad
+dims, signal-to-noise in the cost is ~K/D ≈ 1% — CEM is searching action
+sequences that minimize a function whose ~99% of magnitude is junk. The K
+signal dims also need to encode state in a way an L2 metric can use; our
+probing shows they don't (tworoom: linear R² = −0.58, MLP R² = +0.02 — the
+information is there but tangled). So both rank *and* geometry within the
+used subspace contribute to the gap.
+
+**What scale does and does not change.** Batch size N drops the empirical
+char-fn noise floor as ~1/N; below that floor SIGReg can't separate
+"true Gaussian" from "Gaussian-looking with √(K/D)-suppressed
+contamination." Larger N tightens the residual, but the suppression
+factor is geometric and independent of N — N helps marginally, not
+structurally. M (number of projections) reduces variance of the mean stat
+but not its bias: the mean is dominated by the ~99% of directions in the
+noise subspace whether M=1024 or 10000. Longer training does not close
+the loophole — the encoder is not pushed away from the noise-pad mode by
+SGD. What more training *can* do is reduce absolute pred_loss and
+incidentally raise rank if env intrinsic state dim and data are rich
+enough that prediction needs it. For our toy envs (tworoom 2D, reacher
+4D) prediction does not need high rank; the encoder correctly identifies
+the state is low-dim.
+
+**Closing it within paper spec, by leverage:**
+1. **Shrink pred_dim toward env intrinsic state dim** (biggest in-spec
+   lever). The contamination factor is √(K/D); cutting D from 320 → 32
+   for low-dim envs lifts it from 0.1 to 0.3 — projections start landing
+   close enough to the signal subspace for non-Gaussianity to show up.
+   The paper specifies the loss formula and architecture, not that
+   pred_dim must be 320 for every env.
+2. **Raise λ** (paper's stated knob). Doesn't make SIGReg see new
+   structure but tightens residual error on what it already sees (tail
+   mass, multimodality). Sweep {0.1, 1.0, 10.0}.
+3. **Larger batch** (e.g. 128). Drops noise floor; free with AMP.
+
+**Closing it deviating from paper.** Add `‖(1/N)ZᵀZ − I_D‖²` to the
+loss. SIGReg constrains 1D marginals; this constrains the joint second
+moment. Together they pin both rank and per-dim variance. But this
+makes it a three-term loss, breaking the paper's headline claim. Worth
+reaching for only if all three in-spec levers fail.
+
+**3. AdaLN per-token vs sequence-shared — per-token wins.** 50 steps on
+synthetic, identical seeds, batch 32, T=8:
+
+| step | per-token pred | shared pred |
+|------|----------------|-------------|
+| 0    | 2.02           | 1.99        |
+| 14   | 0.17           | 0.16        |
+| 29   | 0.11           | 0.12        |
+| 49   | **0.047**      | 0.114       |
+
+Both crash similarly through step ~20 (the easy "average dynamics" regime
+where per-step actions don't matter much), then per-token pulls away by
+~2.4× at step 50. Per-token is the right inductive bias for autoregressive
+next-step prediction with per-step actions. Current implementation is correct.
+
+**Net implication**: the gap to the paper is not a bug in overfitting
+capacity, predictor architecture, or SIGReg correctness. It is the
+SIGReg+BN noise-pad loophole, which is structural and unaffected by
+training scale. The recommended order is now: Tier 2 (eval-side sweeps,
+no retraining) and Tier 3 #6/#7/#10 (the three in-spec levers — λ, batch,
+shrink pred_dim) in parallel. The covariance term is a last resort that
+costs the paper's two-term claim.
 
 ### Tier 2 — eval-side wins (no retraining needed)
 4. **Sweep CEM hyperparameters at eval time.** Currently the smoke
@@ -219,19 +331,38 @@ already close part of the gap with no retraining.
    success-rate vs threshold is more honest and lets us compare to
    whatever number the paper actually uses.
 
-### Tier 3 — small training tweaks
-6. **Sweep SIGReg λ** (0.01, 0.1, 1.0). Paper says λ is the only
-   effective tunable knob. If λ=1.0 fixes the rank collapse we've
-   found a paper-spec hyperparameter mismatch, not a budget issue.
-7. **Increase batch size** (128 or 256). SIGReg's empirical
-   characteristic function is a sample average; small batches mean
-   noisy gradients and looser regularization. AMP makes this free.
-8. **Log effective rank during training.** Print every N steps. If
-   collapse happens at init or by step ~20, the regularizer never had
-   a chance and longer training won't recover.
+### Tier 3 — in-spec attacks on the noise-pad loophole
+6. **Sweep SIGReg λ** (0.1, 1.0, 10.0). Paper's stated tunable knob.
+   Doesn't make SIGReg see new structure but tightens the residual on
+   what it does see (tail mass, multimodality). May force the encoder
+   to spread non-Gaussian features across more dims.
+7. **Increase batch size** (128 or 256). Drops the empirical char-fn
+   noise floor (~1/N), making subtler deviations visible above the
+   Monte-Carlo noise. Free with AMP.
+8. **Log effective rank during training.** Print every N steps. Lets
+   us see whether rank ever rises during training or is locked by
+   step ~20, which determines whether other levers are even biting.
+9. **Sanity-check that prediction loss continues to fall** alongside
+   any rank changes. The loophole means rank can rise while pred_loss
+   doesn't — but if pred_loss stops falling when we tighten λ, we've
+   gone too far.
+10. **Shrink `pred_dim` toward env intrinsic state dim** (highest
+    leverage on the loophole). Contamination factor in random
+    projections is √(K/D); cutting D from 320 → 32 for low-state-dim
+    envs lifts it from 0.1 to ~0.3 — projections now land close enough
+    to the signal subspace for non-Gaussianity to register.
+    Suggested per-env: tworoom 32, reacher 64, pusht 128, cube 192.
 
 ### Tier 4 — only after the above
-9. Increase training budget toward the paper's "hours" (~30 min/env).
+11. Increase training budget toward the paper's "hours" (~30 min/env).
+    Note that scale alone does not close the loophole; it can only
+    raise rank incidentally if prediction needs it.
+
+### Tier 5 — paper-deviating, last resort
+12. **Add covariance term** `‖(1/N)ZᵀZ − I_D‖²` to the loss. Constrains
+    joint second moment; together with SIGReg pins both rank and
+    per-dim variance. Closes the loophole at the source but costs the
+    paper's "two-term loss" headline claim.
 
 ## Open todos
 
